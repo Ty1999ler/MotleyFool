@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "foolwatch-dashboard",
+      "runtimeExecutable": "py",
+      "runtimeArgs": ["-m", "streamlit", "run", "foolwatch/dashboard.py",
+                      "--server.port", "8531", "--server.headless", "true"],
+      "port": 8531
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+# Surfaces and ink from the validated reference palette, so the Altair mark
+# colours are measured against the surface they actually render on.
+
+[theme]
+base = "light"
+primaryColor = "#2a78d6"
+backgroundColor = "#fcfcfb"
+secondaryBackgroundColor = "#f9f9f7"
+textColor = "#0b0b0b"
+
+[browser]
+gatherUsageStats = false
+
+[server]
+fileWatcherType = "auto"

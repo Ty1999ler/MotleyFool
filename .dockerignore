@@ -1,0 +1,13 @@
+data/
+reports/
+.git/
+.venv/
+.claude/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.md
+run_daily.bat
+.dockerignore
+Dockerfile
+docker-compose.yml

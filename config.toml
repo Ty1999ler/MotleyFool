@@ -1,0 +1,33 @@
+# foolwatch configuration
+
+[fool]
+# Which fool.com sections to keep. Tickers live under /investing/; adding
+# "retirement" or "money" widens coverage but most of it is ticker-free.
+sections = ["investing"]
+
+# Politeness. requests_per_second is a global cap shared by all workers.
+#
+# Learned the hard way: 6 req/s across 8 workers earned a 23-hour 429 cooldown
+# from fool.com after ~420 articles. 4 req/s ran clean but was close enough to
+# the edge that it is not worth repeating. 2 req/s is the default now, and the
+# limiter halves itself on any 429 and only creeps back after 200 clean fetches.
+# A 100k backfill at this rate is ~14 hours, so run it as a nightly drip rather
+# than one long session.
+requests_per_second = 2.0
+workers = 4
+
+# Stop the crawl outright if the origin asks for a cooldown longer than this
+# (seconds), leaving the queue pending instead of burning through it.
+max_backoff_seconds = 120
+
+# Stop reading each article at </head>. Everything we need (title, author,
+# tickers, primary_tickers) sits in the first ~17 KB of a ~300 KB page.
+head_bytes = 32000
+retries = 3
+
+[analysis]
+timezone = "America/New_York"
+price_lookback_days = 45
+# A ticker that only appears in an article's meta tag - not in primary_tickers -
+# is an incidental comparison. Default the dashboard to primary coverage only.
+primary_only_default = true

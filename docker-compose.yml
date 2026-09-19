@@ -1,0 +1,69 @@
+# foolwatch on a Synology NAS (Container Manager -> Project -> this file).
+#
+# Two containers share one SQLite file on a bind mount:
+#   worker    - scrapes daily, and drips through the archive backfill overnight
+#   dashboard - the Streamlit UI
+#
+# SQLite in WAL mode handles one writer plus one reader fine, which is exactly
+# this shape. Keep both on the same local volume - WAL does not behave over a
+# network share.
+
+services:
+  worker:
+    build: .
+    image: foolwatch:latest
+    container_name: foolwatch-worker
+    restart: unless-stopped
+    command: ["python", "-m", "foolwatch.scheduler"]
+    volumes:
+      - ${FOOLWATCH_DATA:-./data}:/app/data
+    environment:
+      TZ: ${TZ:-America/New_York}
+      # Daily catch-up, in the container's local time.
+      FOOLWATCH_DAILY_AT: ${FOOLWATCH_DAILY_AT:-18:30}
+      # Quiet window for chipping away at the archive backfill.
+      FOOLWATCH_BACKFILL: ${FOOLWATCH_BACKFILL:-1}
+      FOOLWATCH_BACKFILL_START: ${FOOLWATCH_BACKFILL_START:-01:00}
+      FOOLWATCH_BACKFILL_END: ${FOOLWATCH_BACKFILL_END:-06:00}
+      FOOLWATCH_BACKFILL_BATCH: ${FOOLWATCH_BACKFILL_BATCH:-1500}
+      # Politeness, overridable without rebuilding the image. Lower the rate if
+      # you ever see 429s in the logs; do not raise it.
+      FOOLWATCH_RPS: ${FOOLWATCH_RPS:-2}
+      FOOLWATCH_WORKERS: ${FOOLWATCH_WORKERS:-4}
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  dashboard:
+    build: .
+    image: foolwatch:latest
+    container_name: foolwatch-dashboard
+    restart: unless-stopped
+    command:
+      - streamlit
+      - run
+      - foolwatch/dashboard.py
+      - --server.port=8501
+      - --server.address=0.0.0.0
+      - --server.headless=true
+      - --browser.gatherUsageStats=false
+    ports:
+      # Reachable from your LAN at http://<nas-ip>:8531 — not the internet.
+      # Change to "127.0.0.1:8531:8501" to require an SSH tunnel instead.
+      - "${FOOLWATCH_PORT:-8531}:8501"
+    volumes:
+      - ${FOOLWATCH_DATA:-./data}:/app/data
+    environment:
+      TZ: ${TZ:-America/New_York}
+    depends_on:
+      - worker
+    healthcheck:
+      test: ["CMD-SHELL",
+             "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8501/_stcore/health',timeout=5).status==200 else 1)\""]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
