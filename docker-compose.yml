@@ -1,44 +1,56 @@
-# foolwatch on a Synology NAS (Container Manager -> Project -> this file).
+# foolwatch on the Synology DS1522+.
 #
-# Two containers share one SQLite file on a bind mount:
-#   worker    - scrapes daily, and drips through the archive backfill overnight
-#   dashboard - the Streamlit UI
+# One-time setup on the NAS — see the Deploy Playbook:
+#   sudo mkdir -p /volume1/docker/foolwatch/data
+#   sudo chown -R 1000 /volume1/docker/foolwatch/data   # trap #2, load-bearing
+#   cd /volume1/docker/foolwatch
+#   sudo docker-compose pull && sudo docker-compose up -d
+#   curl -s http://localhost:8531/_stcore/health
 #
-# SQLite in WAL mode handles one writer plus one reader fine, which is exactly
-# this shape. Keep both on the same local volume - WAL does not behave over a
-# network share.
+# The ghcr package is public (the repo is public and the image holds no
+# secrets — the database is excluded by .dockerignore), so no docker login
+# is needed and Watchtower cannot die from an expired token.
+#
+# No Watchtower service here by design: one Watchtower per NAS already runs
+# with --label-enable and adopts anything carrying the label below.
 
 services:
-  worker:
-    build: .
-    image: foolwatch:latest
+  foolwatch-worker:
+    image: ghcr.io/ty1999ler/motleyfool:latest
     container_name: foolwatch-worker
-    restart: unless-stopped
     command: ["python", "-m", "foolwatch.scheduler"]
+    restart: unless-stopped
     volumes:
-      - ${FOOLWATCH_DATA:-./data}:/app/data
+      - ./data:/app/data
     environment:
-      TZ: ${TZ:-America/New_York}
-      # Daily catch-up, in the container's local time.
-      FOOLWATCH_DAILY_AT: ${FOOLWATCH_DAILY_AT:-18:30}
-      # Quiet window for chipping away at the archive backfill.
-      FOOLWATCH_BACKFILL: ${FOOLWATCH_BACKFILL:-1}
-      FOOLWATCH_BACKFILL_START: ${FOOLWATCH_BACKFILL_START:-01:00}
-      FOOLWATCH_BACKFILL_END: ${FOOLWATCH_BACKFILL_END:-06:00}
-      FOOLWATCH_BACKFILL_BATCH: ${FOOLWATCH_BACKFILL_BATCH:-1500}
-      # Politeness, overridable without rebuilding the image. Lower the rate if
-      # you ever see 429s in the logs; do not raise it.
-      FOOLWATCH_RPS: ${FOOLWATCH_RPS:-2}
-      FOOLWATCH_WORKERS: ${FOOLWATCH_WORKERS:-4}
+      TZ: America/New_York
+      FOOLWATCH_DAILY_AT: "18:30"
+      FOOLWATCH_BACKFILL: "1"
+      FOOLWATCH_BACKFILL_START: "01:00"
+      FOOLWATCH_BACKFILL_END: "06:00"
+      FOOLWATCH_BACKFILL_BATCH: "1500"
+      # Politeness. 6 req/s once earned a 23-hour 429 ban from fool.com.
+      # Lower this if 429s appear in the logs; never raise it.
+      FOOLWATCH_RPS: "2"
+      FOOLWATCH_WORKERS: "4"
+    # The worker serves no HTTP, so it proves liveness by writing to its own
+    # database — which is exactly the failure mode trap #2 describes.
+    healthcheck:
+      test: ["CMD-SHELL",
+             "python -c \"import sqlite3;c=sqlite3.connect('/app/data/foolwatch.db');c.execute('CREATE TABLE IF NOT EXISTS _health(t INTEGER)');c.execute('INSERT INTO _health VALUES(1)');c.execute('DELETE FROM _health');c.commit()\""]
+      interval: 5m
+      timeout: 20s
+      retries: 3
+      start_period: 1m
+    labels:
+      - com.centurylinklabs.watchtower.enable=true
     logging:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
 
-  dashboard:
-    build: .
-    image: foolwatch:latest
+  foolwatch-dashboard:
+    image: ghcr.io/ty1999ler/motleyfool:latest
     container_name: foolwatch-dashboard
-    restart: unless-stopped
     command:
       - streamlit
       - run
@@ -47,23 +59,22 @@ services:
       - --server.address=0.0.0.0
       - --server.headless=true
       - --browser.gatherUsageStats=false
+    restart: unless-stopped
     ports:
-      # Reachable from your LAN at http://<nas-ip>:8531 — not the internet.
-      # Change to "127.0.0.1:8531:8501" to require an SSH tunnel instead.
-      - "${FOOLWATCH_PORT:-8531}:8501"
+      - "8531:8501"   # http://NAS-IP:8531 — LAN only, no login
     volumes:
-      - ${FOOLWATCH_DATA:-./data}:/app/data
+      - ./data:/app/data
     environment:
-      TZ: ${TZ:-America/New_York}
-    depends_on:
-      - worker
+      TZ: America/New_York
     healthcheck:
       test: ["CMD-SHELL",
              "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8501/_stcore/health',timeout=5).status==200 else 1)\""]
-      interval: 60s
+      interval: 1m
       timeout: 10s
       retries: 3
       start_period: 40s
+    labels:
+      - com.centurylinklabs.watchtower.enable=true
     logging:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }

@@ -17,12 +17,21 @@ COPY config.toml ./
 # Chart surfaces are validated against this theme's background, so ship it.
 COPY .streamlit/ ./.streamlit/
 
-# The SQLite database and log live here; mount a volume over it so they
-# survive a rebuild.
-RUN mkdir -p /app/data
+# --uid 1000 is load-bearing: the bind-mounted host data dir must be chown'd
+# to 1000 to match, or every SQLite write fails silently and the scraper
+# quietly stops persisting anything.
+RUN useradd --create-home --uid 1000 appuser \
+    && mkdir -p /app/data \
+    && chown -R appuser:appuser /app/data
+USER appuser
+
 VOLUME ["/app/data"]
 
 EXPOSE 8501
+
+# Per-service healthchecks live in docker-compose.yml: the dashboard serves
+# HTTP and the worker does not, so a single image-level check cannot describe
+# both.
 
 # Overridden per service in docker-compose.yml.
 CMD ["python", "-m", "foolwatch.scheduler"]

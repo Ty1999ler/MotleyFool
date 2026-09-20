@@ -1,0 +1,4 @@
+[tool.pytest.ini_options]
+# The import path itself is handled by the root conftest.py, per the deploy
+# playbook's trap #1 — kept there so every NAS app is configured the same way.
+testpaths = ["tests"]

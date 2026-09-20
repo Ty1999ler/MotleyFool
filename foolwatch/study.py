@@ -622,9 +622,13 @@ def verdict(paired: pd.DataFrame, by_ordinal: pd.DataFrame) -> str:
                 f"({horizon} horizon) — far too few to conclude anything. "
                 "Finish the backfill.")
 
-    # Do the three measures point the same way?
-    signs = {np.sign(mean_d), np.sign(med_d), 1.0 if wins > 50 else -1.0}
-    agree = len(signs - {0.0}) == 1 and 0.0 not in {np.sign(med_d)}
+    # Do the three measures point the same way? A win rate inside the 45-55
+    # band casts no directional vote: treating an exact 50% as bearish would
+    # make a textbook coin flip look like disagreement.
+    near_even = 45 <= wins <= 55
+    win_vote = 0.0 if near_even else (1.0 if wins > 50 else -1.0)
+    signs = {np.sign(mean_d), np.sign(med_d), win_vote}
+    agree = len(signs - {0.0}) == 1 and np.sign(med_d) != 0
 
     body = (f"Over {horizon}, across {n:,} tickers: the 1st article beat the 2nd "
             f"by {mean_d:+.2f} pts on average, {med_d:+.2f} pts at the median, "
@@ -634,7 +638,7 @@ def verdict(paired: pd.DataFrame, by_ordinal: pd.DataFrame) -> str:
         return (f"{body} Those disagree, which means a few large outliers are "
                 "driving the average rather than a consistent edge — treat this "
                 "as no evidence either way.")
-    if abs(med_d) < 0.5 or 45 <= wins <= 55:
+    if abs(med_d) < 0.5 or near_even:
         return f"{body} That is too small and too close to a coin flip to act on."
     direction = "earlier was better" if mean_d > 0 else "earlier was worse"
     return (f"{body} All three agree, so {direction} in this sample. Still an "
