@@ -391,6 +391,9 @@ def crawl_pending(conn: sqlite3.Connection, cfg: Config, limit: int | None = Non
     # the cooldown worse. Trip out and leave the rest of the queue pending.
     abort = threading.Event()
     abort_reason: list[str] = []
+    # How long the origin actually asked us to wait, so the caller can stand
+    # down for that long rather than guessing.
+    cooldowns: list[float] = []
 
     def work(path: str):
         if abort.is_set():
@@ -405,8 +408,9 @@ def crawl_pending(conn: sqlite3.Connection, cfg: Config, limit: int | None = Non
             wait = e.retry_after
             if wait is not None and wait > cfg.max_backoff_seconds:
                 if not abort.is_set():
+                    cooldowns.append(wait)
                     abort_reason.append(
-                        f"origin asked for {wait / 3600:.1f}h cooldown "
+                        f"origin asked for a {wait / 60:.0f} min cooldown "
                         f"(Retry-After={wait:.0f}s)")
                     abort.set()
                 return path, None, ("deferred", f"429 Retry-After={wait:.0f}s")
@@ -456,6 +460,7 @@ def crawl_pending(conn: sqlite3.Connection, cfg: Config, limit: int | None = Non
                   "cooldown expires.", abort_reason[0], totals["deferred"])
     log.info("Crawl finished in %.1f min: %s", (time.monotonic() - started) / 60, totals)
     totals["aborted"] = bool(abort_reason)
+    totals["cooldown_seconds"] = max(cooldowns) if cooldowns else 0.0
     return totals
 
 

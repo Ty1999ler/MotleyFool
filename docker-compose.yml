@@ -26,13 +26,20 @@ services:
       TZ: America/New_York
       FOOLWATCH_DAILY_AT: "18:30"
       FOOLWATCH_BACKFILL: "1"
-      FOOLWATCH_BACKFILL_START: "01:00"
-      FOOLWATCH_BACKFILL_END: "06:00"
-      FOOLWATCH_BACKFILL_BATCH: "1500"
-      # Politeness. 6 req/s once earned a 23-hour 429 ban from fool.com.
-      # Lower this if 429s appear in the logs; never raise it.
-      FOOLWATCH_RPS: "2"
-      FOOLWATCH_WORKERS: "4"
+      # Measured: fool.com allows roughly 300 requests per 10 minutes (~0.5/s)
+      # however fast you burst. Bursting just trips the throttle sooner, and a
+      # tripped throttle once escalated to a 23-hour ban. So crawl below the
+      # threshold continuously instead of sprinting and stalling: 0.4/s is
+      # ~34,000 articles a day, which drains a 100k backlog in about three
+      # days without ever provoking a 429.
+      #
+      # Once the queue is empty set FOOLWATCH_BACKFILL=0 and the daily run
+      # alone keeps things current.
+      FOOLWATCH_BACKFILL_START: "00:00"
+      FOOLWATCH_BACKFILL_END: "23:59"
+      FOOLWATCH_BACKFILL_BATCH: "1200"
+      FOOLWATCH_RPS: "0.4"
+      FOOLWATCH_WORKERS: "2"
     # The worker serves no HTTP, so it proves liveness by writing to its own
     # database — which is exactly the failure mode trap #2 describes.
     healthcheck:

@@ -101,8 +101,14 @@ def run_daily(conn, cfg) -> None:
     log.info("Daily run complete: %s", res)
 
 
-def run_backfill_batch(conn, cfg, batch: int) -> bool:
-    """Crawl one batch. Returns False if the origin asked us to stand down."""
+def run_backfill_batch(conn, cfg, batch: int) -> tuple[bool, float]:
+    """Crawl one batch.
+
+    Returns (ok, cooldown_seconds). `cooldown_seconds` is what the origin
+    actually asked for, so the caller can stand down for exactly that long —
+    fool.com's cooldowns range from ten minutes to a full day, and treating a
+    ten-minute throttle like a day-long ban wastes most of a night.
+    """
     started = utc_now()
     res = fool.crawl_pending(conn, cfg, limit=batch)
     conn.execute(
@@ -110,11 +116,12 @@ def run_backfill_batch(conn, cfg, batch: int) -> bool:
         "coverage_new, notes) VALUES ('backfill', ?, ?, ?, ?, ?)",
         (started, utc_now(), res["articles"], res["coverage"],
          f"failed={res['failed']} gone={res['gone']} "
-         f"aborted={res.get('aborted', False)}"))
+         f"aborted={res.get('aborted', False)} "
+         f"cooldown={res.get('cooldown_seconds', 0):.0f}s"))
     conn.commit()
     log.info("Backfill batch complete: %s (%d still pending)",
              res, _pending(conn))
-    return not res.get("aborted", False)
+    return not res.get("aborted", False), float(res.get("cooldown_seconds", 0.0))
 
 
 def main() -> int:
@@ -154,11 +161,16 @@ def main() -> int:
                     and (backfill_blocked_until is None
                          or now >= backfill_blocked_until)):
                 log.info("Backfill window — crawling a batch of %d", st.batch)
-                if not run_backfill_batch(conn, cfg, st.batch):
-                    # Long cooldown: stand down for a full day.
-                    backfill_blocked_until = now + timedelta(hours=24)
-                    log.warning("Origin asked for a long cooldown — pausing "
-                                "backfill until %s", backfill_blocked_until)
+                ok, cooldown = run_backfill_batch(conn, cfg, st.batch)
+                if not ok:
+                    # Wait exactly as long as the origin asked, plus a small
+                    # margin. A flat stand-down would throw away the rest of
+                    # the night over a ten-minute throttle.
+                    wait = cooldown if cooldown > 0 else 3600.0
+                    backfill_blocked_until = now + timedelta(seconds=wait + 60)
+                    log.warning("Origin asked for a %.0f min cooldown — pausing "
+                                "backfill until %s", wait / 60,
+                                backfill_blocked_until.strftime("%H:%M:%S"))
         except Exception as e:                 # noqa: BLE001 - the loop must survive
             log.exception("Tick failed, continuing: %s", e)
 
