@@ -114,12 +114,37 @@ taken by another app on this machine).
 | View | What it answers |
 |---|---|
 | **Overview** | How much is being published, the bullish/bearish balance, most-covered tickers. **Select a row to read that company's articles in place.** |
+| **Track record** | What actually happened after every call: hit rate with a confidence interval, median beside mean, which call types beat a coin flip, a growth-of-$1 line for buying every bullish call vs SPY, the outcome distribution, performance by quarter, best and worst calls, and every call with its link. Filter by holding period (1/3/6/12 months), direction and author. |
 | **Ticker history** | When a ticker was first covered, every article since with links, net stance over time, price vs. SPY. The picker searches on company name as well as symbol. |
 | **First coverage** | Coverage start date, **how fast coverage ramped** (days to 2nd article, articles in the first 30/90 days), and market-adjusted returns **1/3/12 months before and after** the first article |
 | **Signals** | **Stance flips** — where the Fool changed its mind about a company — and **coverage spikes**, companies it has suddenly started writing about a lot |
 | **Early vs late** | Whether the 1st article beat later ones, bucketed and paired within ticker |
 | **Author accuracy** | How often each author's directional calls went the right way, with Wilson intervals and a base-rate comparison |
 | **Authors** | Who writes the most, how many tickers they cover, their stance lean |
+
+### Reading the Track record
+
+Every call's return is measured from the first close on or after publication,
+**minus SPY over the same trading sessions**, and signed so a positive number
+always means the call paid — a bearish call scores when the stock lags. A
+"call" is a headline that takes a direction; news, predictions and analysis
+are excluded rather than counted as wrong.
+
+Two things to hold onto when reading it:
+
+- **Median and mean disagree, on purpose.** Across 2023–2026 the median call
+  trailed SPY while the mean beat it, because a small minority of enormous
+  winners carries the average. That is why the growth-of-$1 line can beat SPY
+  even though most individual calls lost to it: a diversified basket catches
+  the winners.
+- **Survivorship flatters everything on the page.** Delisted and acquired
+  stocks have no price history, so their calls can't be scored at all. Those
+  skew toward losers. The page reports how many calls it couldn't score.
+
+Outcomes are precomputed by the worker into a `call_outcomes` table after each
+daily run, so the page reads one small table rather than millions of price
+rows. Stance is joined fresh from `articles`, so a `restance` after a
+classifier fix takes effect without recomputing anything.
 
 ### The before/after columns
 
@@ -277,6 +302,8 @@ schtasks /Create /TN "foolwatch daily" /TR "\"C:\Users\atp2txw\PycharmProjects\f
 | `enumerate --from YYYY/MM --to YYYY/MM` | Queue urls without crawling |
 | `crawl [--limit N] [--requeue]` | Drain the pending queue; resumable |
 | `prices [--range 5y] [--min-articles N]` | Refresh Yahoo closes |
+| `prices --history [--limit N]` | Deepen each ticker's price history to a year before its first call, so old calls can be scored. Idempotent — each ticker is fetched once. The daily run does this automatically. |
+| `outcomes [--full]` | Score what happened after every call into `call_outcomes`. Incremental: only calls whose 12-month window is still open are revisited. The daily run does this automatically. |
 | `restance` | Re-run the headline classifier over stored articles, in place. Run this after any change to `stance.py` — stance is written at crawl time, so existing rows go stale, and this needs no refetching. |
 | `status` | Article/coverage/queue/stance counts |
 | `dashboard [--port N]` | Launch the Streamlit app |

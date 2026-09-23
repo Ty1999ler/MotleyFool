@@ -3,6 +3,12 @@ name: Test, build and publish
 on:
   push:
     branches: [main]
+    # Watchtower redeploys the NAS containers whenever a new image lands, which
+    # kills any job running inside the worker. A docs-only push has nothing to
+    # deploy, so it should not restart production. (A push touching code and
+    # docs together still builds: paths-ignore only skips when every changed
+    # file matches.)
+    paths-ignore: ["**.md"]
   pull_request:
 
 # Workflow level, not job level. A job-level group is entered in test-finish
