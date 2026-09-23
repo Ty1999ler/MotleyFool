@@ -28,7 +28,7 @@ from zoneinfo import ZoneInfo
 import requests
 
 from . import config as cfgmod
-from . import fool, prices, universe
+from . import fool, prices, study, universe
 from .db import get_conn, utc_now
 
 log = logging.getLogger("foolwatch.scheduler")
@@ -65,6 +65,20 @@ class Settings:
         return t >= self.backfill_start or t < self.backfill_end
 
 
+def _last_daily_day(conn, tz) -> str | None:
+    """Local date of the last completed daily run.
+
+    Held in the database rather than in memory because Watchtower recreates the
+    container on every push; an in-memory flag reset each time, so every deploy
+    re-ran the whole daily job.
+    """
+    row = conn.execute(
+        "SELECT MAX(finished_utc) AS t FROM runs WHERE kind = 'daily'").fetchone()
+    if not row or not row["t"]:
+        return None
+    return datetime.fromtimestamp(row["t"], tz).strftime("%Y-%m-%d")
+
+
 def _pending(conn) -> int:
     return conn.execute(
         "SELECT COUNT(*) c FROM crawl_queue WHERE state = 'pending'").fetchone()["c"]
@@ -90,6 +104,17 @@ def run_daily(conn, cfg) -> None:
         prices.update_prices(conn, cfg, range_="3mo", min_articles=3)
     except Exception as e:                     # noqa: BLE001 - never kill the loop
         log.error("Price refresh failed: %s", e)
+    # The 3-month refresh keeps prices current but never reaches back to old
+    # calls. Deepen history for any ticker that needs it (a no-op once each is
+    # done), then rescore whatever calls are still maturing.
+    try:
+        prices.ensure_history(conn, cfg)
+    except Exception as e:                     # noqa: BLE001
+        log.error("Price history backfill failed: %s", e)
+    try:
+        study.compute_call_outcomes(conn)
+    except Exception as e:                     # noqa: BLE001
+        log.error("Call outcome scoring failed: %s", e)
 
     conn.execute(
         "INSERT INTO runs (kind, started_utc, finished_utc, articles_new, "
@@ -143,7 +168,7 @@ def main() -> int:
              st.backfill_start, st.backfill_end, st.batch,
              cfg.requests_per_second, _pending(conn))
 
-    last_daily: str | None = None
+    last_daily: str | None = _last_daily_day(conn, st.tz)
     backfill_blocked_until: datetime | None = None
 
     while True:

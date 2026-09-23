@@ -10,7 +10,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
 CONFIG_PATH = ROOT / "config.toml"
-DB_PATH = DATA_DIR / "foolwatch.db"
+# FOOLWATCH_DB points the CLI and dashboard at another database, e.g. a
+# snapshot pulled from the NAS for testing, without touching the live one.
+DB_PATH = (Path(os.environ["FOOLWATCH_DB"]) if os.environ.get("FOOLWATCH_DB")
+           else DATA_DIR / "foolwatch.db")
 LOG_PATH = DATA_DIR / "foolwatch.log"
 
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "

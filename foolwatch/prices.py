@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import requests
 
@@ -19,16 +19,30 @@ BENCHMARK = "SPY"
 
 
 def fetch_daily(symbol: str, range_: str = "1y",
-                session: requests.Session | None = None) -> list[tuple[str, float, int]]:
+                session: requests.Session | None = None,
+                start: date | None = None) -> list[tuple[str, float, int]]:
     """Fetch daily closes as [(YYYY-MM-DD, close, volume), ...].
+
+    Pass `start` to fetch from an exact date to today instead of a coarse
+    Yahoo range, so a ticker first covered in 2021 fetches from 2020 rather
+    than dragging in a decade it will never use.
 
     Raises requests.RequestException on network trouble, ValueError when the
     symbol simply has no data.
     """
     sess = session or requests
+    if start is not None:
+        params = {
+            "period1": int(datetime(start.year, start.month, start.day,
+                                    tzinfo=timezone.utc).timestamp()),
+            "period2": int(datetime.now(timezone.utc).timestamp()),
+            "interval": "1d", "events": "div,splits",
+        }
+    else:
+        params = {"range": range_, "interval": "1d", "events": "div,splits"}
     resp = sess.get(
         CHART_URL.format(symbol=symbol),
-        params={"range": range_, "interval": "1d", "events": "div,splits"},
+        params=params,
         headers=HEADERS,
         timeout=30,
     )
@@ -143,6 +157,111 @@ def update_prices(conn: sqlite3.Connection, cfg: Config, range_: str = "1y",
 
     log.info("Prices updated: %d ok, %d failed", updated, failed)
     return {"updated": updated, "failed": failed}
+
+
+#: How far before a ticker's first primary article its price history must reach:
+#: a year for the 12-month "before" window, plus slack for holidays and weekends.
+HISTORY_LEAD_DAYS = 400
+
+
+def ensure_history(conn: sqlite3.Connection, cfg: Config,
+                   lead_days: int = HISTORY_LEAD_DAYS,
+                   limit: int | None = None) -> dict:
+    """Backfill price history far enough back to score every call.
+
+    The daily refresh fetches three months at a time, which keeps things
+    current but leaves every archived call with no prices around it — the
+    reason calls from 2023 could not be scored at all. This finds each verified
+    primary ticker whose stored history starts later than (its first primary
+    article - lead_days) and fetches from exactly that date to today.
+
+    Idempotent. `tickers.history_from` records how far back Yahoo has already
+    been asked for, so a stock that listed after that date (whose history can
+    never reach back far enough) is fetched once rather than every day.
+    """
+    session = requests.Session()
+    firsts = conn.execute(
+        """
+        SELECT c.ticker, MIN(c.published_day) AS first_day,
+               COUNT(*) AS n, MAX(t.history_from) AS history_from
+        FROM coverage c
+        LEFT JOIN tickers t ON t.ticker = c.ticker
+        WHERE c.is_primary = 1 AND c.verified = 1
+        GROUP BY c.ticker
+        ORDER BY n DESC
+        """
+    ).fetchall()
+    earliest = {r["symbol"]: r["d"] for r in conn.execute(
+        "SELECT symbol, MIN(date) AS d FROM prices GROUP BY symbol")}
+    slack = timedelta(days=7)
+
+    todo: list[tuple[str, str, date]] = []
+    # The benchmark has to reach back as far as the oldest call of all.
+    if firsts:
+        oldest = min(date.fromisoformat(r["first_day"]) for r in firsts)
+        need = oldest - timedelta(days=lead_days)
+        have = earliest.get(BENCHMARK)
+        if not have or date.fromisoformat(have) > need + slack:
+            todo.append((BENCHMARK, BENCHMARK, need))
+
+    for r in firsts:
+        need = date.fromisoformat(r["first_day"]) - timedelta(days=lead_days)
+        if r["history_from"] and date.fromisoformat(r["history_from"]) <= need:
+            continue                      # already asked for this far back
+        sym = resolve_yahoo_symbol(conn, r["ticker"], session)
+        if not sym:
+            continue
+        have = earliest.get(sym)
+        if have and date.fromisoformat(have) <= need + slack:
+            conn.execute("UPDATE tickers SET history_from = ? WHERE ticker = ?",
+                         (need.isoformat(), r["ticker"]))
+            continue
+        todo.append((r["ticker"], sym, need))
+    conn.commit()
+
+    if limit:
+        todo = todo[: int(limit)]
+    log.info("Price history: %d symbols need deeper history", len(todo))
+
+    fetched, failed, rows_added, consecutive_errors = 0, 0, 0, 0
+    for i, (ticker, sym, need) in enumerate(todo, 1):
+        try:
+            rows_ = fetch_daily(sym, session=session, start=need)
+            conn.executemany(
+                "INSERT OR REPLACE INTO prices (symbol, date, close, volume) "
+                "VALUES (?, ?, ?, ?)",
+                [(sym, d, c, v) for d, c, v in rows_],
+            )
+            rows_added += len(rows_)
+            fetched += 1
+            consecutive_errors = 0
+        except ValueError as e:
+            # Genuinely no data for that span. Fall through to the marker so
+            # it is not re-requested every day.
+            failed += 1
+            log.info("No history for %s (%s): %s", ticker, sym, e)
+        except requests.RequestException as e:
+            failed += 1
+            consecutive_errors += 1
+            log.warning("History fetch failed for %s (%s): %s", ticker, sym, e)
+            if consecutive_errors >= 10:
+                # Yahoo is refusing; leave the rest unmarked so the next run
+                # retries them, rather than grinding through the list.
+                log.error("Ten consecutive history failures — stopping this run")
+                break
+            continue
+        if ticker != BENCHMARK:
+            conn.execute("UPDATE tickers SET history_from = ? WHERE ticker = ?",
+                         (need.isoformat(), ticker))
+        conn.commit()
+        if i % 100 == 0:
+            log.info("  history %d/%d (%d rows added)", i, len(todo), rows_added)
+        time.sleep(0.25)
+
+    log.info("Price history done: %d fetched, %d failed, %d rows added",
+             fetched, failed, rows_added)
+    return {"fetched": fetched, "failed": failed, "rows": rows_added,
+            "needed": len(todo)}
 
 
 def yahoo_symbol_for(conn: sqlite3.Connection, ticker: str) -> str | None:

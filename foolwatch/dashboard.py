@@ -942,20 +942,33 @@ def view_signals() -> None:
 
 
 def view_authors() -> None:
+    # Two aggregates joined once. Article stats come from articles alone —
+    # joining coverage first counted a three-stock article as three articles
+    # and weighted each author's average stance toward multi-stock pieces.
+    # Ticker counts are one grouped pass rather than a per-author subquery:
+    # SQLite drives that subquery from the coverage side, so repeating it for
+    # 300 authors took ~43 minutes at 100k articles.
     rows = q(
         """
-        SELECT a.author,
-               COUNT(*) AS articles,
-               ROUND(AVG(a.stance_score), 2) AS avg_stance,
-               MIN(a.published_day) AS first_seen,
-               MAX(a.published_day) AS last_seen,
-               COUNT(DISTINCT c.ticker) AS tickers
-        FROM articles a
-        LEFT JOIN coverage c ON c.path = a.path AND c.is_primary = 1
-        WHERE a.published_day BETWEEN ? AND ? AND a.author <> ''
-        GROUP BY a.author
+        WITH arts AS (
+            SELECT author,
+                   COUNT(*) AS articles,
+                   ROUND(AVG(stance_score), 2) AS avg_stance,
+                   MIN(published_day) AS first_seen,
+                   MAX(published_day) AS last_seen
+            FROM articles
+            WHERE published_day BETWEEN ? AND ? AND author <> ''
+            GROUP BY author),
+        tick AS (
+            SELECT a.author, COUNT(DISTINCT c.ticker) AS tickers
+            FROM articles a
+            JOIN coverage c ON c.path = a.path AND c.is_primary = 1
+            WHERE a.published_day BETWEEN ? AND ? AND a.author <> ''
+            GROUP BY a.author)
+        SELECT arts.*, COALESCE(tick.tickers, 0) AS tickers
+        FROM arts LEFT JOIN tick USING (author)
         ORDER BY articles DESC
-        """, DAYS)
+        """, DAYS + DAYS)
     if rows.empty:
         st.info("No authors in this window.")
         return
@@ -1121,19 +1134,350 @@ def view_study() -> None:
         )
 
 
-tabs = st.tabs(["Overview", "Ticker history", "First coverage", "Signals",
-                "Early vs late", "Author accuracy", "Authors"])
-with tabs[0]:
-    view_overview()
-with tabs[1]:
-    view_ticker()
-with tabs[2]:
-    view_first_coverage()
-with tabs[3]:
-    view_signals()
-with tabs[4]:
-    view_study()
-with tabs[5]:
-    view_author_accuracy()
-with tabs[6]:
-    view_authors()
+@st.cache_data(ttl="30m", show_spinner="Loading the track record…")
+def load_track_record() -> pd.DataFrame:
+    try:
+        df = study.track_record_frame(get_conn())
+    except Exception:                          # noqa: BLE001 - table not built yet
+        return pd.DataFrame()
+    if not df.empty:
+        df["bucket"] = df["stance"].map(BUCKET).fillna("No call")
+    return df
+
+
+#: Directional call types, strongest bullish to strongest bearish.
+CALL_ORDER = ["Buy", "Buy (question)", "Caution", "Sell (question)", "Sell"]
+
+VERDICT_ORDER = ["Right more often than not", "Can't tell from a coin flip",
+                 "Wrong more often than not"]
+
+
+def _verdict_label(lo: float, hi: float) -> str:
+    if lo > 50:
+        return VERDICT_ORDER[0]
+    if hi < 50:
+        return VERDICT_ORDER[2]
+    return VERDICT_ORDER[1]
+
+
+def view_track_record() -> None:
+    st.caption(
+        "What actually happened after every call. Each article's return is "
+        "measured from the first close on or after publication, **minus SPY over "
+        "the same trading sessions**, and signed so that a positive number always "
+        "means the call paid — a bearish call scores when the stock lags."
+    )
+
+    df = load_track_record()
+    if df.empty:
+        st.info("Call outcomes haven't been computed yet. The worker builds them "
+                "after its daily run, or run `python -m foolwatch outcomes` in the "
+                "worker container.")
+        return
+
+    df = df[(df["published_day"] >= pd.Timestamp(start))
+            & (df["published_day"] <= pd.Timestamp(end))]
+    calls_all = df[df["stance_score"] != 0]
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        label = st.segmented_control(
+            "Holding period", list(study.TRACK_HORIZONS), default="3m",
+            key="tr_h") or "3m"
+    with c2:
+        direction = st.segmented_control(
+            "Calls", ["All", "Bullish", "Bearish"], default="All",
+            key="tr_dir") or "All"
+    with c3:
+        counts = calls_all["author"].value_counts()
+        author = st.selectbox(
+            "Author", ["All authors", *counts.index],
+            format_func=lambda a: a if a == "All authors" else f"{a} ({counts[a]:,})",
+            key="tr_author")
+
+    by_author = calls_all if author == "All authors" else \
+        calls_all[calls_all["author"] == author]
+    calls = by_author
+    if direction == "Bullish":
+        calls = calls[calls["stance_score"] > 0]
+    elif direction == "Bearish":
+        calls = calls[calls["stance_score"] < 0]
+
+    col = f"call_{label}"
+    scored = calls[col].dropna()
+    unpriced = int(calls["entry_date"].isna().sum())
+    maturing = int(calls["entry_date"].notna().sum() - len(scored))
+
+    if scored.empty:
+        st.warning(f"No calls in this selection have a full {label} of price "
+                   "history after them yet.")
+        return
+
+    hits = int((scored > 0).sum())
+    lo, hi = study.wilson(hits, len(scored))
+    med, mean = scored.median(), scored.mean()
+
+    with st.container(horizontal=True):
+        st.metric("Calls measured", f"{len(scored):,}", border=True,
+                  help=f"Calls with a full {label} of prices after them.")
+        st.metric("Went the right way", f"{hits / len(scored) * 100:.1f}%",
+                  f"95% CI {lo:.0f}–{hi:.0f}%", delta_color="off", border=True)
+        st.metric("Median call vs SPY", f"{med:+.2f} pts", border=True,
+                  help="The typical call. Half did better, half worse.")
+        st.metric("Mean call vs SPY", f"{mean:+.2f} pts", border=True,
+                  help="Pulled up or down by the biggest winners and losers.")
+
+    skew = ""
+    if mean > 0 > med:
+        skew = (" The **typical call lost to SPY while the average gained** — a "
+                "minority of very large winners carries the whole record. You "
+                "only capture that by holding many of them, which the chart "
+                "below tests.")
+    elif med > 0 and mean > 0:
+        skew = " Both the typical call and the average beat SPY."
+    elif med < 0 and mean < 0:
+        skew = " Both the typical call and the average trailed SPY."
+    st.info(
+        f"Over **{label}**, **{hits / len(scored) * 100:.0f}%** of these "
+        f"{len(scored):,} calls went the right way (95% CI {lo:.0f}–{hi:.0f}%). "
+        f"Median **{med:+.2f}** pts vs SPY, mean **{mean:+.2f}**.{skew}"
+    )
+
+    # --- scorecard by call type ---------------------------------------------
+    with st.container(border=True):
+        st.subheader("Which kinds of call worked")
+        st.caption(
+            "Share of each call type that went the right way, with its 95% "
+            "confidence interval. A call type is only better or worse than chance "
+            "if its whole whisker clears the dashed 50% line."
+        )
+        sc = study.scorecard(by_author, "bucket")
+        sc = sc[sc["bucket"].isin(CALL_ORDER)]
+        sc = sc[sc[f"n_{label}"] > 0]
+        if sc.empty:
+            st.caption("No scored calls to break down.")
+        else:
+            sc = sc.assign(
+                hit=sc[f"hit_{label}"], lo=sc[f"lo_{label}"], hi=sc[f"hi_{label}"],
+                n=sc[f"n_{label}"], median=sc[f"median_{label}"])
+            sc["verdict"] = [_verdict_label(a, b) for a, b in zip(sc["lo"], sc["hi"])]
+            lo_x = max(0.0, float(sc["lo"].min()) - 5)
+            hi_x = min(100.0, float(sc["hi"].max()) + 5)
+            color = alt.Color(
+                "verdict:N", sort=VERDICT_ORDER,
+                scale=alt.Scale(domain=VERDICT_ORDER, range=[BULL, NEUTRAL, BEAR]),
+                legend=alt.Legend(title=None, orient="bottom"))
+            y = alt.Y("bucket:N", sort=CALL_ORDER, title=None)
+            tips = [alt.Tooltip("bucket:N", title="Call type"),
+                    alt.Tooltip("hit:Q", title="Right %", format=".1f"),
+                    alt.Tooltip("lo:Q", title="CI low", format=".1f"),
+                    alt.Tooltip("hi:Q", title="CI high", format=".1f"),
+                    alt.Tooltip("n:Q", title="Calls", format=","),
+                    alt.Tooltip("median:Q", title="Median vs SPY", format="+.2f")]
+            fifty = alt.Chart(pd.DataFrame({"x": [50]})).mark_rule(
+                color=NEUTRAL, strokeDash=[4, 4]).encode(x="x:Q")
+            whisk = alt.Chart(sc).mark_rule(strokeWidth=2).encode(
+                x=alt.X("lo:Q", scale=alt.Scale(domain=[lo_x, hi_x]),
+                        title="Share of calls that went the right way (%)"),
+                x2="hi:Q", y=y, color=color, tooltip=tips)
+            dots = alt.Chart(sc).mark_point(filled=True, size=110, opacity=1).encode(
+                x="hit:Q", y=y, color=color, tooltip=tips)
+            st.altair_chart((fifty + whisk + dots).properties(height=230))
+
+            present = [c for c in CALL_ORDER if c in set(sc["bucket"])]
+            table = sc.set_index("bucket").reindex(present).reset_index()
+            out = pd.DataFrame({"Call type": table["bucket"]})
+            cfg_cols = {"Call type": st.column_config.TextColumn(pinned=True)}
+            for h in study.TRACK_HORIZONS:
+                out[f"{h} calls"] = table[f"n_{h}"]
+                out[f"{h} right"] = table[f"hit_{h}"]
+                out[f"{h} median"] = table[f"median_{h}"]
+                cfg_cols[f"{h} calls"] = st.column_config.NumberColumn(format="%d")
+                cfg_cols[f"{h} right"] = st.column_config.NumberColumn(format="%.1f%%")
+                cfg_cols[f"{h} median"] = st.column_config.NumberColumn(
+                    format="%+.2f", help="Median call return vs SPY, in points.")
+            st.dataframe(out, hide_index=True, column_config=cfg_cols)
+
+    # --- follow the calls ---------------------------------------------------
+    with st.container(border=True):
+        st.subheader("If you'd bought every bullish call")
+        st.caption(
+            "Each month, an equal-weight basket of every stock that got a bullish "
+            "call, bought at the publication close and held one month, chained "
+            "month to month. A stock counts once per month however many buy "
+            "articles it got. Always the 1-month hold: longer holds overlap, and "
+            "chaining them would overstate compounding."
+        )
+        fsrc = df if author == "All authors" else df[df["author"] == author]
+        f = study.follow_the_calls(fsrc, "1m")
+        if f.empty or len(f) < 2:
+            st.caption("Not enough monthly baskets yet.")
+        else:
+            names = {"follow_growth": "Buy every bullish call", "spy_growth": "SPY"}
+            long = f.melt(id_vars=["month", "calls"], value_vars=list(names),
+                          var_name="series", value_name="growth")
+            long["series"] = long["series"].map(names)
+            scale = alt.Scale(domain=list(names.values()), range=[BULL, NEUTRAL])
+            lines = alt.Chart(long).mark_line(strokeWidth=2).encode(
+                x=alt.X("month:T", title=None),
+                y=alt.Y("growth:Q", title="Growth of $1",
+                        scale=alt.Scale(zero=False), axis=alt.Axis(format="$.2f")),
+                color=alt.Color("series:N", scale=scale,
+                                legend=alt.Legend(title=None, orient="bottom")),
+                tooltip=[alt.Tooltip("month:T", title="Month", format="%b %Y"),
+                         alt.Tooltip("series:N", title="Series"),
+                         alt.Tooltip("growth:Q", title="Value of $1", format="$.2f"),
+                         alt.Tooltip("calls:Q", title="Stocks in basket")])
+            last = long[long["month"] == long["month"].max()].copy()
+            last["txt"] = last["growth"].map(lambda v: f"${v:.2f}")
+            ends = alt.Chart(last).mark_text(
+                align="left", dx=6, fontWeight="bold").encode(
+                x="month:T", y="growth:Q", text="txt:N",
+                color=alt.Color("series:N", scale=scale, legend=None))
+            st.altair_chart((lines + ends).properties(height=280))
+            beat = int((f["basket"] > f["spy"]).sum())
+            st.caption(
+                f"{len(f)} monthly baskets, averaging {f['calls'].mean():.0f} "
+                f"stocks. The basket beat SPY in {beat} of {len(f)} months. "
+                "Ignores costs, taxes and slippage, and delisted stocks are "
+                "missing entirely, which flatters this line.")
+
+    left, right = st.columns(2)
+    # --- distribution -------------------------------------------------------
+    with left:
+        with st.container(border=True):
+            st.subheader("How the calls turned out")
+            st.caption(f"Every call's {label} return vs SPY. Right of zero, the "
+                       "call paid. Tails clipped at -100 / +200 pts for display.")
+            step = 5 if label in ("1m", "3m") else 10
+            edges = np.arange(-100, 200 + step, step)
+            n_bin, _ = np.histogram(scored.clip(-100, 200), bins=edges)
+            hist = pd.DataFrame({"start": edges[:-1], "end": edges[1:], "calls": n_bin})
+            hist = hist[hist["calls"] > 0]
+            hist["side"] = np.where(hist["start"] >= 0, "Call paid", "Call did not pay")
+            st.altair_chart(
+                alt.Chart(hist).mark_bar(cornerRadiusTopLeft=2,
+                                         cornerRadiusTopRight=2).encode(
+                    x=alt.X("start:Q", title="Call return vs SPY (pts)"),
+                    x2="end:Q",
+                    y=alt.Y("calls:Q", title="Calls"),
+                    color=alt.Color(
+                        "side:N",
+                        scale=alt.Scale(domain=["Call paid", "Call did not pay"],
+                                        range=[BULL, BEAR]),
+                        legend=alt.Legend(title=None, orient="bottom")),
+                    tooltip=[alt.Tooltip("start:Q", title="From"),
+                             alt.Tooltip("end:Q", title="To"),
+                             alt.Tooltip("calls:Q", title="Calls", format=",")],
+                ).properties(height=260))
+
+    # --- over time ----------------------------------------------------------
+    with right:
+        with st.container(border=True):
+            st.subheader("When their calls worked")
+            st.caption(f"Median {label} call return vs SPY, by the quarter the "
+                       "call was made. Quarters with under 30 calls are hidden.")
+            by_q = calls.dropna(subset=[col]).copy()
+            by_q["quarter"] = by_q["published_day"].dt.to_period("Q").dt.to_timestamp()
+            qa = (by_q.groupby("quarter")[col]
+                      .agg(calls="size", median="median",
+                           right=lambda s: (s > 0).mean() * 100)
+                      .reset_index())
+            qa = qa[qa["calls"] >= 30]
+            if qa.empty:
+                st.caption("Not enough calls per quarter yet.")
+            else:
+                st.altair_chart(
+                    alt.Chart(qa).mark_bar(cornerRadiusEnd=3).encode(
+                        x=alt.X("quarter:T", timeUnit="yearquarter", title=None),
+                        y=alt.Y("median:Q", title="Median call vs SPY (pts)"),
+                        color=alt.condition(alt.datum.median >= 0,
+                                            alt.value(BULL), alt.value(BEAR)),
+                        tooltip=[alt.Tooltip("quarter:T", timeUnit="yearquarter",
+                                             title="Quarter"),
+                                 alt.Tooltip("median:Q", title="Median", format="+.2f"),
+                                 alt.Tooltip("right:Q", title="Right %", format=".1f"),
+                                 alt.Tooltip("calls:Q", title="Calls", format=",")],
+                    ).properties(height=260))
+
+    # --- best and worst -----------------------------------------------------
+    ranked = calls.dropna(subset=[col]).copy()
+    ranked["url"] = BASE + ranked["path"]
+    show = ["published_day", "ticker", "title", "author", "bucket", col, "url"]
+    fmt = {
+        "published_day": st.column_config.DateColumn("Published"),
+        "ticker": st.column_config.TextColumn("Ticker"),
+        "title": st.column_config.TextColumn("Headline", width="large"),
+        "author": st.column_config.TextColumn("Author"),
+        "bucket": st.column_config.TextColumn("Call"),
+        col: st.column_config.NumberColumn(f"{label} vs SPY", format="%+.1f"),
+        "url": st.column_config.LinkColumn("Link", display_text="read"),
+    }
+    b1, b2 = st.columns(2)
+    with b1:
+        with st.container(border=True):
+            st.subheader("Best calls")
+            st.dataframe(ranked.nlargest(15, col)[show], hide_index=True,
+                         column_config=fmt)
+    with b2:
+        with st.container(border=True):
+            st.subheader("Worst calls")
+            st.dataframe(ranked.nsmallest(15, col)[show], hide_index=True,
+                         column_config=fmt)
+
+    # --- every call ---------------------------------------------------------
+    with st.container(border=True):
+        st.subheader("Every call")
+        st.caption("Sort any column. Returns are vs SPY, signed so positive means "
+                   "the call paid; blank means that window hasn't closed yet.")
+        every = calls.copy()
+        every["url"] = BASE + every["path"]
+        cols_every = ["published_day", "ticker", "title", "author", "bucket",
+                      *[f"call_{h}" for h in study.TRACK_HORIZONS], "url"]
+        fmt_every = {k: v for k, v in fmt.items() if k != col}
+        for h in study.TRACK_HORIZONS:
+            fmt_every[f"call_{h}"] = st.column_config.NumberColumn(h, format="%+.1f")
+        st.dataframe(every.sort_values("published_day", ascending=False)[cols_every],
+                     hide_index=True, column_config=fmt_every)
+
+    with st.expander("How this is measured, and what it can't tell you"):
+        st.markdown(
+            f"- **{unpriced:,}** calls in this selection couldn't be scored at all: "
+            "no price history, usually because the stock was delisted, acquired or "
+            "trades abroad. Those skew toward losers, so everything above is "
+            "**flattered by survivorship**.\n"
+            f"- **{maturing:,}** more are too recent for a full {label} window.\n"
+            "- Entry is the first close on or after publication. Articles publish "
+            "during the trading day, so that is the earliest price a reader could "
+            "realistically act on.\n"
+            "- Months are trading sessions: 1m = 21, 3m = 63, 6m = 126, 12m = 252.\n"
+            "- A call is the headline's stance, read by a keyword classifier. It "
+            "misreads unusual headlines, and articles that take no direction are "
+            "excluded rather than counted as wrong.\n"
+            "- Only the company an article is actually about is scored. Before "
+            "2021 fool.com tagged every stock in a multi-stock piece as primary, "
+            "so older calls include more passing mentions.\n"
+            "- Correlation, not a strategy: coverage tends to follow a move, and "
+            "none of this accounts for costs, taxes, slippage or position sizing."
+        )
+
+
+# Lazy tabs. By default st.tabs executes every tab's code on every rerun, even
+# hidden ones, and the analysis tabs each run a full event study: instant at
+# 900 articles, minutes at 100,000. on_change="rerun" plus the .open guards
+# means only the tab being looked at does any work.
+VIEWS = [
+    ("Overview", view_overview),
+    ("Track record", view_track_record),
+    ("Ticker history", view_ticker),
+    ("First coverage", view_first_coverage),
+    ("Signals", view_signals),
+    ("Early vs late", view_study),
+    ("Author accuracy", view_author_accuracy),
+    ("Authors", view_authors),
+]
+tabs = st.tabs([name for name, _ in VIEWS], key="view", on_change="rerun")
+for tab, (_, view) in zip(tabs, VIEWS):
+    if tab.open:
+        with tab:
+            view()

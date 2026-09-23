@@ -161,10 +161,24 @@ def cmd_daily(args, cfg, conn) -> int:
 
 
 def cmd_prices(args, cfg, conn) -> int:
+    if args.history:
+        res = prices.ensure_history(conn, cfg, limit=args.limit)
+        print(f"Price history: {res['fetched']} fetched, {res['failed']} failed, "
+              f"{res['rows']:,} rows added ({res['needed']} needed)")
+        return 0
     res = prices.update_prices(conn, cfg, range_=args.range,
                                min_articles=args.min_articles,
                                only_missing=args.only_missing)
     print(f"Prices: {res['updated']} symbols updated, {res['failed']} failed")
+    return 0
+
+
+def cmd_outcomes(args, cfg, conn) -> int:
+    from . import study
+
+    res = study.compute_call_outcomes(conn, full=args.full)
+    print(f"Call outcomes: {res['computed']:,} computed, "
+          f"{res['scored']:,} with a usable entry price")
     return 0
 
 
@@ -265,6 +279,13 @@ def main(argv: list[str] | None = None) -> int:
     pr.add_argument("--min-articles", type=int, default=3,
                     help="skip tickers with fewer than N coverage rows")
     pr.add_argument("--only-missing", action="store_true")
+    pr.add_argument("--history", action="store_true",
+                    help="deepen history so every call can be scored")
+    pr.add_argument("--limit", type=int, help="with --history: at most N symbols")
+
+    oc = sub.add_parser("outcomes", help="score what happened after every call")
+    oc.add_argument("--full", action="store_true",
+                    help="rescore every call, not just maturing ones")
 
     sub.add_parser("restance",
                    help="re-run the headline classifier over stored articles")
@@ -283,7 +304,7 @@ def main(argv: list[str] | None = None) -> int:
         "setup": cmd_setup, "enumerate": cmd_enumerate, "crawl": cmd_crawl,
         "backfill": cmd_backfill, "daily": cmd_daily, "prices": cmd_prices,
         "status": cmd_status, "dashboard": cmd_dashboard,
-        "restance": cmd_restance,
+        "restance": cmd_restance, "outcomes": cmd_outcomes,
     }
     try:
         return handlers[args.cmd](args, cfg, conn)

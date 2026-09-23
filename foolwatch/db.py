@@ -42,6 +42,11 @@ CREATE TABLE IF NOT EXISTS coverage (
 CREATE INDEX IF NOT EXISTS idx_coverage_ticker_day ON coverage(ticker, published_day);
 CREATE INDEX IF NOT EXISTS idx_coverage_day ON coverage(published_day);
 CREATE INDEX IF NOT EXISTS idx_coverage_primary ON coverage(is_primary, ticker);
+-- The primary key is (ticker, path), which cannot serve a lookup by path
+-- alone. Without this, any join from articles to coverage scanned every
+-- coverage row per article: ~10 billion row visits at 100k articles, which
+-- hung the Authors tab outright.
+CREATE INDEX IF NOT EXISTS idx_coverage_path ON coverage(path);
 
 -- Crawl queue. Every URL the sitemaps offer lands here first, so a backfill
 -- can be stopped and resumed without refetching, and failures are visible.
@@ -75,7 +80,8 @@ CREATE TABLE IF NOT EXISTS tickers (
     name TEXT,
     yahoo_symbol TEXT,
     yahoo_failed INTEGER DEFAULT 0,
-    first_seen_day TEXT
+    first_seen_day TEXT,
+    history_from TEXT                   -- earliest date Yahoo has been asked for
 );
 
 CREATE TABLE IF NOT EXISTS prices (
@@ -85,6 +91,27 @@ CREATE TABLE IF NOT EXISTS prices (
     volume INTEGER,
     PRIMARY KEY(symbol, date)
 );
+
+-- One row per primary (article, ticker) pair: what the stock did after the
+-- article, and what SPY did over the same sessions. Computed by the worker so
+-- the dashboard reads a small table instead of millions of price rows.
+-- Returns are percent; NULL where the price series does not reach that far.
+-- Deliberately holds nothing from the article itself: stance is re-scored
+-- whenever the classifier improves, so it is joined fresh from `articles`.
+CREATE TABLE IF NOT EXISTS call_outcomes (
+    path TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    published_day TEXT,
+    entry_date TEXT,                    -- first session on/after publication
+    entry_close REAL,
+    ret_21 REAL,  spy_21 REAL,          -- ~1 month
+    ret_63 REAL,  spy_63 REAL,          -- ~3 months
+    ret_126 REAL, spy_126 REAL,         -- ~6 months
+    ret_252 REAL, spy_252 REAL,         -- ~12 months
+    computed_utc INTEGER,
+    PRIMARY KEY (path, ticker)
+);
+CREATE INDEX IF NOT EXISTS idx_outcomes_day ON call_outcomes(published_day);
 
 CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,7 +133,20 @@ def get_conn(path: Path = DB_PATH) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after a database was first created.
+
+    CREATE TABLE IF NOT EXISTS never alters an existing table, so a column
+    added to SCHEMA later has to be added to live databases here.
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(tickers)")}
+    if "history_from" not in cols:
+        conn.execute("ALTER TABLE tickers ADD COLUMN history_from TEXT")
+        conn.commit()
 
 
 def utc_now() -> int:

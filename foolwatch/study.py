@@ -37,6 +37,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from dataclasses import dataclass
+from typing import Iterable
 
 import numpy as np
 import pandas as pd
@@ -88,6 +89,33 @@ class _PriceBook:
             g = grp.sort_values("date")
             self._dates[sym] = g["date"].to_numpy(dtype="datetime64[D]")
             self._closes[sym] = g["close"].to_numpy(dtype=float)
+
+    @classmethod
+    def from_db(cls, conn: sqlite3.Connection,
+                symbols: "Iterable[str] | None" = None) -> "_PriceBook":
+        """Load straight from SQLite, one symbol at a time.
+
+        Walks the (symbol, date) primary-key index into compact numpy arrays
+        and never builds a DataFrame of every price row. With history back to
+        2019 that is millions of rows, and a pandas frame of them costs several
+        hundred megabytes that a dashboard on a shared NAS cannot spare.
+        """
+        book = cls.__new__(cls)
+        book._dates, book._closes = {}, {}
+        if symbols is None:
+            symbols = [r[0] for r in conn.execute("SELECT DISTINCT symbol FROM prices")]
+        for sym in dict.fromkeys(s for s in symbols if s):
+            rows = conn.execute(
+                "SELECT date, close FROM prices WHERE symbol = ? AND close IS NOT NULL "
+                "ORDER BY date", (sym,)).fetchall()
+            if rows:
+                book._dates[sym] = np.array([r[0] for r in rows], dtype="datetime64[D]")
+                book._closes[sym] = np.array([r[1] for r in rows], dtype=float)
+        return book
+
+    @property
+    def symbols(self) -> list[str]:
+        return list(self._dates)
 
     def has(self, sym: str) -> bool:
         return sym in self._dates
@@ -169,12 +197,10 @@ def build_events(conn: sqlite3.Connection, *, primary_only: bool = True,
     cov = cov.merge(symbols, on="ticker", how="inner")
     cov["published_day"] = pd.to_datetime(cov["published_day"])
 
-    prices = pd.read_sql_query("SELECT symbol, date, close FROM prices", conn)
-    if prices.empty:
+    book = _PriceBook.from_db(conn, [*cov["yahoo_symbol"].unique(), BENCHMARK])
+    if not book.symbols:
         return StudyResult(cov, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(),
                            ["No price history stored — run `foolwatch prices`."])
-    prices["date"] = pd.to_datetime(prices["date"])
-    book = _PriceBook(prices)
     if not book.has(BENCHMARK):
         return StudyResult(cov, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(),
                            [f"No {BENCHMARK} benchmark stored — market-adjusted "
@@ -304,11 +330,9 @@ def coverage_timeline(conn: sqlite3.Connection, *, primary_only: bool = True,
         return pd.DataFrame(), ["No verified coverage stored yet."]
     cov["published_day"] = pd.to_datetime(cov["published_day"])
 
-    prices = pd.read_sql_query("SELECT symbol, date, close FROM prices", conn)
-    if prices.empty:
+    book = _PriceBook.from_db(conn, [*cov["yahoo_symbol"].dropna().unique(), BENCHMARK])
+    if not book.symbols:
         return pd.DataFrame(), ["No price history — run `foolwatch prices`."]
-    prices["date"] = pd.to_datetime(prices["date"])
-    book = _PriceBook(prices)
     if market_adjusted and not book.has(BENCHMARK):
         notes.append(f"No {BENCHMARK} history stored, so returns are raw, not "
                      "market-adjusted. Run `foolwatch prices`.")
@@ -644,3 +668,169 @@ def verdict(paired: pd.DataFrame, by_ordinal: pd.DataFrame) -> str:
     return (f"{body} All three agree, so {direction} in this sample. Still an "
             "association, not an edge: coverage follows momentum, delisted "
             "names are missing, and costs are not modelled.")
+
+
+# --- track record ------------------------------------------------------------
+#
+# What happened after every call. The event study above asks a narrow question
+# (did the first article beat later ones); this answers the broad one: when the
+# Fool said buy, or sell, what did the stock actually do next?
+
+#: Holding periods for the track record, in trading sessions.
+TRACK_HORIZONS: dict[str, int] = {"1m": 21, "3m": 63, "6m": 126, "12m": 252}
+_LONGEST = max(TRACK_HORIZONS.values())
+
+
+def compute_call_outcomes(conn: sqlite3.Connection, *, full: bool = False) -> dict:
+    """Score what happened after every primary article, and store it.
+
+    One row per primary (article, ticker): the stock's return and SPY's return
+    over the same sessions at 1, 3, 6 and 12 months. Stored raw, not
+    market-adjusted, so the dashboard can show both and can draw a strategy
+    line against SPY on the same axis.
+
+    Incremental by default. A row whose 12-month legs are both filled can never
+    change again, so the daily run only revisits calls whose windows are still
+    maturing, plus new ones. Calls with no usable prices are still written, with
+    NULL returns, so the page can say how many calls could not be scored rather
+    than silently dropping them — which is where survivorship bias hides.
+    """
+    from .db import utc_now
+
+    maturing = "" if full else (
+        "AND (o.path IS NULL OR o.ret_252 IS NULL OR o.spy_252 IS NULL)")
+    rows = conn.execute(
+        f"""
+        SELECT c.path, c.ticker, c.published_day, t.yahoo_symbol
+        FROM coverage c
+        JOIN tickers t ON t.ticker = c.ticker
+        LEFT JOIN call_outcomes o ON o.path = c.path AND o.ticker = c.ticker
+        WHERE c.is_primary = 1 AND c.verified = 1
+          AND t.yahoo_symbol IS NOT NULL
+          {maturing}
+        """
+    ).fetchall()
+    if not rows:
+        return {"computed": 0, "scored": 0}
+
+    book = _PriceBook.from_db(conn, [*{r["yahoo_symbol"] for r in rows}, BENCHMARK])
+    if not book.has(BENCHMARK):
+        log.warning("No %s history; cannot score calls", BENCHMARK)
+        return {"computed": 0, "scored": 0}
+
+    now = utc_now()
+    out, scored = [], 0
+    for r in rows:
+        sym, day = r["yahoo_symbol"], np.datetime64(r["published_day"], "D")
+        rec = [r["path"], r["ticker"], r["published_day"], None, None]
+        legs: list[float | None] = [None] * (2 * len(TRACK_HORIZONS))
+        ei = book.entry_index(sym, day) if book.has(sym) else None
+        # A series that only starts well after the article gives a fake entry.
+        if ei is not None and (book.entry_date(sym, ei) - day).astype(int) <= 7:
+            d0 = book.entry_date(sym, ei)
+            rec[3] = str(d0)
+            rec[4] = float(book._closes[sym][ei])
+            for k, h in enumerate(TRACK_HORIZONS.values()):
+                if ei + h < book.size(sym):
+                    legs[2 * k] = book.ret(sym, ei, ei + h)
+                    legs[2 * k + 1] = book.ret_between_dates(
+                        BENCHMARK, d0, book.entry_date(sym, ei + h))
+            scored += 1
+        out.append((*rec, *legs, now))
+
+    conn.executemany(
+        "INSERT OR REPLACE INTO call_outcomes (path, ticker, published_day, "
+        "entry_date, entry_close, ret_21, spy_21, ret_63, spy_63, ret_126, "
+        "spy_126, ret_252, spy_252, computed_utc) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", out)
+    conn.commit()
+    log.info("Call outcomes: %d computed, %d with a usable entry price",
+             len(out), scored)
+    return {"computed": len(out), "scored": scored}
+
+
+def track_record_frame(conn: sqlite3.Connection) -> pd.DataFrame:
+    """Every scored call, joined to fresh article metadata, with outcomes.
+
+    Adds, per horizon label (1m/3m/6m/12m):
+      excess_<h>  stock return minus SPY over the same sessions
+      call_<h>    excess signed by the call's direction, so positive always
+                  means "the call paid": a bearish call scores when the stock
+                  lags. NaN for articles that took no direction.
+      hit_<h>     call_<h> > 0, NaN where there is no directional call
+    """
+    df = pd.read_sql_query(
+        """
+        SELECT o.*, a.title, a.author, a.stance, a.stance_score
+        FROM call_outcomes o
+        JOIN articles a ON a.path = o.path
+        """,
+        conn,
+    )
+    if df.empty:
+        return df
+    df["published_day"] = pd.to_datetime(df["published_day"])
+    direction = np.sign(df["stance_score"]).replace(0, np.nan)
+    for label, h in TRACK_HORIZONS.items():
+        excess = df[f"ret_{h}"] - df[f"spy_{h}"]
+        df[f"excess_{label}"] = excess
+        df[f"call_{label}"] = excess * direction
+        df[f"hit_{label}"] = np.where(df[f"call_{label}"].isna(), np.nan,
+                                      (df[f"call_{label}"] > 0).astype(float))
+    return df
+
+
+def scorecard(df: pd.DataFrame, group: str = "stance") -> pd.DataFrame:
+    """Hit rate and median/mean outcome per group at every horizon.
+
+    Medians sit beside means because a handful of 10-baggers can carry a mean
+    on their own; the Wilson interval says how much the hit rate can be trusted.
+    """
+    calls = df[df["stance_score"] != 0]
+    rows = []
+    for name, g in calls.groupby(group, sort=False):
+        row = {group: name, "calls": len(g)}
+        for label in TRACK_HORIZONS:
+            col = g[f"call_{label}"].dropna()
+            hits = int((col > 0).sum())
+            lo, hi = wilson(hits, len(col))
+            row.update({
+                f"n_{label}": len(col),
+                f"hit_{label}": hits / len(col) * 100 if len(col) else np.nan,
+                f"lo_{label}": lo, f"hi_{label}": hi,
+                f"median_{label}": col.median() if len(col) else np.nan,
+                f"mean_{label}": col.mean() if len(col) else np.nan,
+            })
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def follow_the_calls(df: pd.DataFrame, label: str = "1m") -> pd.DataFrame:
+    """Growth of $1 from buying every bullish call, month by month, vs SPY.
+
+    Each calendar month's bullish calls form an equal-weight basket, held for
+    the horizon, and the baskets are chained. A ticker is counted once per
+    month however many bullish articles it got — otherwise the stocks the Fool
+    writes about constantly (Nvidia, Tesla) would dominate every basket, and no
+    real portfolio buys the same stock twenty times in a month.
+
+    Only meaningful at the 1-month horizon, where consecutive baskets barely
+    overlap; longer holds overlap months and chaining them would overstate
+    compounding. Approximate either way: entries fall on different days within
+    the month, and costs, taxes and slippage are ignored.
+    """
+    h = TRACK_HORIZONS[label]
+    bull = df[(df["stance_score"] > 0)
+              & df[f"ret_{h}"].notna() & df[f"spy_{h}"].notna()].copy()
+    if bull.empty:
+        return pd.DataFrame()
+    bull["month"] = bull["published_day"].dt.to_period("M").dt.to_timestamp()
+    bull = bull.sort_values("published_day").drop_duplicates(["month", "ticker"])
+    m = (bull.groupby("month")
+             .agg(calls=("ticker", "size"),
+                  basket=(f"ret_{h}", "mean"),
+                  spy=(f"spy_{h}", "mean"))
+             .reset_index())
+    m["follow_growth"] = (1 + m["basket"] / 100).cumprod()
+    m["spy_growth"] = (1 + m["spy"] / 100).cumprod()
+    return m
