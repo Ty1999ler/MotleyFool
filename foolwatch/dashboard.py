@@ -1148,8 +1148,7 @@ def load_track_record() -> pd.DataFrame:
 #: Directional call types, strongest bullish to strongest bearish.
 CALL_ORDER = ["Buy", "Buy (question)", "Caution", "Sell (question)", "Sell"]
 
-VERDICT_ORDER = ["Right more often than not", "Can't tell from a coin flip",
-                 "Wrong more often than not"]
+VERDICT_ORDER = ["Beats a coin flip", "Can't tell", "Worse than a coin flip"]
 
 
 def _verdict_label(lo: float, hi: float) -> str:
@@ -1274,15 +1273,24 @@ def view_track_record() -> None:
                     alt.Tooltip("hi:Q", title="CI high", format=".1f"),
                     alt.Tooltip("n:Q", title="Calls", format=","),
                     alt.Tooltip("median:Q", title="Median vs SPY", format="+.2f")]
+            # One explicit scale on every layer: Altair's quantitative scales
+            # include zero by default, and any layer that kept that default
+            # dragged the shared axis back to 0, squashing every dot into a
+            # narrow band.
+            xs = alt.Scale(domain=[lo_x, hi_x], zero=False, nice=False)
+            x_title = "Share of calls that went the right way (%)"
             fifty = alt.Chart(pd.DataFrame({"x": [50]})).mark_rule(
-                color=NEUTRAL, strokeDash=[4, 4]).encode(x="x:Q")
+                color=NEUTRAL, strokeDash=[4, 4]).encode(
+                x=alt.X("x:Q", scale=xs, title=x_title))
             whisk = alt.Chart(sc).mark_rule(strokeWidth=2).encode(
-                x=alt.X("lo:Q", scale=alt.Scale(domain=[lo_x, hi_x]),
-                        title="Share of calls that went the right way (%)"),
+                x=alt.X("lo:Q", scale=xs, title=x_title),
                 x2="hi:Q", y=y, color=color, tooltip=tips)
             dots = alt.Chart(sc).mark_point(filled=True, size=110, opacity=1).encode(
-                x="hit:Q", y=y, color=color, tooltip=tips)
-            st.altair_chart((fifty + whisk + dots).properties(height=230))
+                x=alt.X("hit:Q", scale=xs, title=x_title),
+                y=y, color=color, tooltip=tips)
+            # A fixed row height per call type; a fixed chart height let Vega
+            # drop every other label when rows got tight.
+            st.altair_chart((fifty + whisk + dots).properties(height=alt.Step(44)))
 
             present = [c for c in CALL_ORDER if c in set(sc["bucket"])]
             table = sc.set_index("bucket").reindex(present).reset_index()
@@ -1292,7 +1300,7 @@ def view_track_record() -> None:
                 out[f"{h} calls"] = table[f"n_{h}"]
                 out[f"{h} right"] = table[f"hit_{h}"]
                 out[f"{h} median"] = table[f"median_{h}"]
-                cfg_cols[f"{h} calls"] = st.column_config.NumberColumn(format="%d")
+                cfg_cols[f"{h} calls"] = st.column_config.NumberColumn(format="localized")
                 cfg_cols[f"{h} right"] = st.column_config.NumberColumn(format="%.1f%%")
                 cfg_cols[f"{h} median"] = st.column_config.NumberColumn(
                     format="%+.2f", help="Median call return vs SPY, in points.")
@@ -1319,7 +1327,7 @@ def view_track_record() -> None:
             long["series"] = long["series"].map(names)
             scale = alt.Scale(domain=list(names.values()), range=[BULL, NEUTRAL])
             lines = alt.Chart(long).mark_line(strokeWidth=2).encode(
-                x=alt.X("month:T", title=None),
+                x=alt.X("month:T", title=None, axis=alt.Axis(format="%b %Y")),
                 y=alt.Y("growth:Q", title="Growth of $1",
                         scale=alt.Scale(zero=False), axis=alt.Axis(format="$.2f")),
                 color=alt.Color("series:N", scale=scale,
@@ -1347,20 +1355,31 @@ def view_track_record() -> None:
     with left:
         with st.container(border=True):
             st.subheader("How the calls turned out")
+            # Size the axis to where 98% of calls actually land. A fixed
+            # -100..+200 range collapsed the whole distribution into one thin
+            # spike and hid its skew, which is the point of the chart.
+            step = {"1m": 2, "3m": 4, "6m": 5, "12m": 10}[label]
+            lo_c = float(np.floor(scored.quantile(0.01) / step) * step)
+            hi_c = float(np.ceil(scored.quantile(0.99) / step) * step)
             st.caption(f"Every call's {label} return vs SPY. Right of zero, the "
-                       "call paid. Tails clipped at -100 / +200 pts for display.")
-            step = 5 if label in ("1m", "3m") else 10
-            edges = np.arange(-100, 200 + step, step)
-            n_bin, _ = np.histogram(scored.clip(-100, 200), bins=edges)
+                       f"call paid. The outer bars also hold the most extreme 1% "
+                       f"at each end (below {lo_c:+.0f} or above {hi_c:+.0f} pts).")
+            edges = np.arange(lo_c, hi_c + step, step)
+            n_bin, _ = np.histogram(scored.clip(lo_c, hi_c - 1e-9), bins=edges)
             hist = pd.DataFrame({"start": edges[:-1], "end": edges[1:], "calls": n_bin})
             hist = hist[hist["calls"] > 0]
             hist["side"] = np.where(hist["start"] >= 0, "Call paid", "Call did not pay")
+            # Explicit baseline. Given a ranged x (x + x2) and a lone y,
+            # Vega-Lite infers *horizontal* bars sitting at height y, which
+            # rendered every bin as a floating dash.
+            hist["base"] = 0
             st.altair_chart(
                 alt.Chart(hist).mark_bar(cornerRadiusTopLeft=2,
                                          cornerRadiusTopRight=2).encode(
                     x=alt.X("start:Q", title="Call return vs SPY (pts)"),
                     x2="end:Q",
                     y=alt.Y("calls:Q", title="Calls"),
+                    y2="base:Q",
                     color=alt.Color(
                         "side:N",
                         scale=alt.Scale(domain=["Call paid", "Call did not pay"],

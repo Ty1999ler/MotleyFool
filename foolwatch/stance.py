@@ -34,6 +34,26 @@ import re
 # Buy?". These carry buy/sell wording but make no call on either company - and
 # the article is tagged to both tickers, so scoring it +1 would credit a
 # bullish call to the loser as well. Treated as non-directional.
+# "Why Corning Plunged Today" explains a move that already happened; it is news,
+# not a bearish call. Without this, a downward move hit the warning vocabulary
+# first while an upward one ("Why X Soared Today") correctly fell to news — an
+# asymmetry that filed about a quarter of all warnings under the wrong label.
+# Stocks that have just plunged often rebound, so it also skewed the track
+# record against the Fool's cautious calls.
+MOVE_EXPLAINER_RE = re.compile(
+    r"^why\s+.{0,90}?\b(?:plunge[sd]?|plunging|sink(?:s|ing)?|sank|sunk|"
+    r"tumble[sd]?|tumbling|crash(?:es|ed|ing)?|fell|falls|falling|"
+    r"drop(?:s|ped|ping)?|slid(?:e|es|ing)?|slump(?:s|ed|ing)?|"
+    r"skyrocket(?:s|ed|ing)?|soar(?:s|ed|ing)?|jump(?:s|ed|ing)?|"
+    r"surge[sd]?|surging|rall(?:y|ies|ied|ying)|pop(?:s|ped|ping)?|"
+    r"climb(?:s|ed|ing)?|spike[sd]?|spiking|rose|rising|gain(?:s|ed|ing)?)\b",
+    re.I,
+)
+# ...unless it looks forward: "Why a Stock Market Crash Could Be Coming" is a
+# genuine warning, not an explainer.
+FORWARD_RE = re.compile(
+    r"\b(?:could|may|might|will|would|about to|coming|set to)\b", re.I)
+
 COMPARISON_RE = re.compile(
     r"\bvs\.?\s|\bversus\b"
     r"|\bwhich\s+(?:\w+\s+){0,3}?(?:stock|etf|company|one|is)\b.{0,40}\b"
@@ -70,6 +90,9 @@ BUY_STRONG = (
 
 BUY_QUESTION = (
     r"\bis\s+.{0,60}?\ba\s+buy\b",
+    # "Why Is CAVA Stock Crashing, and Is It a Buying Opportunity?" leans buy,
+    # but without this it fell through to the crash wording and scored bearish.
+    r"\bbuying\s+opportunit(?:y|ies)\b",
     r"\bshould\s+you\s+buy\b",
     r"\bis\s+it\s+(?:too\s+late|still\s+time)\s+to\s+buy\b",
     r"\btime\s+to\s+buy\b",
@@ -214,6 +237,10 @@ def classify(title: str) -> tuple[str, int]:
         return ("buy_lean", 1)
     if sell_q:
         return ("sell_lean", -1)
+    # Explicit buy/sell wording above still wins; only a bare move explainer
+    # is demoted to news.
+    if MOVE_EXPLAINER_RE.search(t) and not FORWARD_RE.search(t):
+        return ("news", 0)
     if _any(_HOLD, t):
         return ("hold", 0)
     if _any(_PRED, t):

@@ -127,3 +127,51 @@ def test_rate_limited_carries_retry_after():
     err = RateLimited(79675.0)
     assert err.retry_after == 79675.0
     assert "429" in str(err)
+
+
+def test_crawler_does_not_starve_other_writers(tmp_path, monkeypatch):
+    """A slow crawl must release the write lock regularly.
+
+    Committing only every fifty articles held the lock for two minutes at the
+    polite 0.4 req/s, so a history backfill running alongside it failed with
+    "database is locked". This crawls slowly in one thread while a second
+    connection with a short timeout tries to write.
+    """
+    import sqlite3
+    import threading
+
+    from foolwatch import fool
+    from foolwatch.config import Config
+    from foolwatch.db import get_conn
+
+    db = tmp_path / "c.db"
+    conn = get_conn(db)
+    conn.execute("INSERT INTO universe (ticker) VALUES ('NVDA')")
+    conn.executemany(
+        "INSERT INTO crawl_queue (path, section, published_day, state) "
+        "VALUES (?, 'investing', '2026-01-02', 'pending')",
+        [(f"/investing/2026/01/02/a{i}/",) for i in range(12)])
+    conn.commit()
+
+    head = ('<meta name="tickers" content="NVDA"/>'
+            '<meta name="primary_tickers" content="NVDA"/>'
+            '<meta property="og:title" content="Is Nvidia a Buy?"/></head>')
+
+    def slow_fetch(session, path, cfg, limiter):
+        time.sleep(0.25)
+        return head
+
+    monkeypatch.setattr(fool, "fetch_head", slow_fetch)
+    monkeypatch.setattr(fool, "COMMIT_INTERVAL_SECONDS", 0.2)
+    cfg = Config()
+    cfg.workers, cfg.requests_per_second = 1, 0
+
+    crawl = threading.Thread(target=lambda: fool.crawl_pending(get_conn(db), cfg))
+    crawl.start()
+    time.sleep(0.8)                     # well inside the ~3s crawl
+    other = sqlite3.connect(db, timeout=1.0)
+    other.execute("INSERT INTO runs (kind) VALUES ('probe')")
+    other.commit()                      # raises "database is locked" if starved
+    other.close()
+    crawl.join(timeout=30)
+    assert conn.execute("SELECT COUNT(*) c FROM articles").fetchone()["c"] == 12

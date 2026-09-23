@@ -40,6 +40,32 @@ def test_head_to_head_comparisons_make_no_call(headline):
     assert score == 0
 
 
+@pytest.mark.parametrize("headline", [
+    "Why Corning Plunged Today",
+    "Why ServiceTitan Stock Is Crashing Today",
+    "Why Dave & Buster's Stock Tumbled Today",
+    "Why Super Micro Computer Stock Tumbled Monday Morning",
+    "Why Rocket Lab Stock Soared Today",
+])
+def test_move_explainers_are_news_in_both_directions(headline):
+    """Explaining yesterday's move is not a call. Downward moves used to hit
+    the warning vocabulary while upward ones fell to news — an asymmetry that
+    mislabelled about a quarter of all warnings."""
+    assert classify(headline) == ("news", 0)
+
+
+def test_a_forward_looking_why_is_still_a_warning():
+    """The explainer rule must not swallow genuine warnings."""
+    assert classify("Why a Stock Market Crash Could Be Coming")[0] == "warning"
+
+
+def test_buying_opportunity_leans_buy_even_beside_crash_wording():
+    label, score = classify(
+        "Why Is CAVA Stock Crashing, and Is It a Buying Opportunity?")
+    assert label == "buy_lean"
+    assert score > 0
+
+
 def test_enumerated_list_with_both_directions_is_mixed():
     label, score = classify(
         "Semiconductor Sell-Off: 1 AI Chip Stock to Buy, 1 to Hold, and 1 to Sell")

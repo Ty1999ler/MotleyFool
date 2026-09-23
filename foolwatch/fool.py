@@ -56,6 +56,11 @@ HEAD_END_RE = re.compile(rb"</head>", re.I)
 TITLE_SUFFIX_RE = re.compile(r"\s*\|\s*The Motley Fool\s*$", re.I)
 
 
+#: Longest the crawler holds the SQLite write lock between commits. Short, so
+#: other writers (history backfill, outcome scoring, restance) never time out.
+COMMIT_INTERVAL_SECONDS = 5.0
+
+
 # --- politeness --------------------------------------------------------------
 
 class RateLimited(Exception):
@@ -421,6 +426,7 @@ def crawl_pending(conn: sqlite3.Connection, cfg: Config, limit: int | None = Non
         except Exception as e:                      # noqa: BLE001 - logged and queued
             return path, None, ("failed", f"{type(e).__name__}: {e}")
 
+    last_commit = time.monotonic()
     log.info("Crawling %d articles at %.1f req/s across %d workers",
              len(paths), cfg.requests_per_second, cfg.workers)
     with ThreadPoolExecutor(max_workers=cfg.workers) as pool:
@@ -445,8 +451,13 @@ def crawl_pending(conn: sqlite3.Connection, cfg: Config, limit: int | None = Non
                 conn.execute(
                     "UPDATE crawl_queue SET state = 'done', attempts = attempts + 1 "
                     "WHERE path = ?", (path,))
-            if i % 50 == 0:
+            # Commit by elapsed time as well as by count. Fifty articles was a
+            # dozen seconds at 4 req/s but two minutes at 0.4 req/s, and holding
+            # the write lock that long made every other writer — history
+            # backfill, outcome scoring, restance — hit its timeout and fail.
+            if i % 50 == 0 or time.monotonic() - last_commit >= COMMIT_INTERVAL_SECONDS:
                 conn.commit()
+                last_commit = time.monotonic()
             if i % progress_every == 0 and not abort.is_set():
                 rate = i / max(time.monotonic() - started, 0.001)
                 eta = (len(paths) - i) / max(rate, 0.001) / 60
