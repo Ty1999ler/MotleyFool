@@ -1148,6 +1148,9 @@ def load_track_record() -> pd.DataFrame:
 #: Directional call types, strongest bullish to strongest bearish.
 CALL_ORDER = ["Buy", "Buy (question)", "Caution", "Sell (question)", "Sell"]
 
+#: Rows of "Every call" rendered in the page; the rest are a download.
+EVERY_CALL_ROWS = 500
+
 VERDICT_ORDER = ["Beats a coin flip", "Can't tell", "Worse than a coin flip"]
 
 
@@ -1453,11 +1456,23 @@ def view_track_record() -> None:
         every["url"] = BASE + every["path"]
         cols_every = ["published_day", "ticker", "title", "author", "bucket",
                       *[f"call_{h}" for h in study.TRACK_HORIZONS], "url"]
+        every = every.sort_values("published_day", ascending=False)[cols_every]
         fmt_every = {k: v for k, v in fmt.items() if k != col}
         for h in study.TRACK_HORIZONS:
             fmt_every[f"call_{h}"] = st.column_config.NumberColumn(h, format="%+.1f")
-        st.dataframe(every.sort_values("published_day", ascending=False)[cols_every],
-                     hide_index=True, column_config=fmt_every)
+        # Showing every call meant pushing ~25,000 rows of headlines to the
+        # browser on every rerun: several megabytes in one websocket message,
+        # enough to stall a tab over the LAN. The table shows the most recent
+        # calls; the full set is a download, generated only when clicked.
+        shown = every.head(EVERY_CALL_ROWS)
+        st.caption(f"Showing the {len(shown):,} most recent of {len(every):,} calls "
+                   "matching the filters above. Download the full list below.")
+        st.dataframe(shown, hide_index=True, column_config=fmt_every)
+        st.download_button(
+            f"Download all {len(every):,} calls (CSV)",
+            data=lambda: every.to_csv(index=False),
+            file_name=f"foolwatch_calls_{label}_{direction.lower()}.csv",
+            mime="text/csv", icon=":material/download:", on_click="ignore")
 
     with st.expander("How this is measured, and what it can't tell you"):
         st.markdown(

@@ -223,8 +223,11 @@ docker compose up -d --build
 ```
 
 The dashboard is then at `http://<nas-ip>:8531`, reachable from your LAN but not
-the internet. To require an SSH tunnel instead, change the port mapping in
-`docker-compose.yml` to `"127.0.0.1:8531:8501"`.
+the internet. It has no login, so anyone on the network can read it. Binding it
+to `"127.0.0.1:8531:8501"` and reaching it over an SSH tunnel would lock that
+down, but **Synology's SSH server refuses port forwarding by default**
+("administratively prohibited"), so that only works after enabling it — the
+deploy playbook's route is a Cloudflare Tunnel with Access in front instead.
 
 ### What the worker does on its own
 
